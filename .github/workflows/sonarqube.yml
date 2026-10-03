@@ -1,0 +1,116 @@
+name: SonarQube
+
+# Static analysis of this fork with SonarQube Cloud or a self-hosted SonarQube
+# Server. Analysis scope lives in sonar-project.properties; connection settings
+# come from the repository:
+#
+#   secrets.SONAR_TOKEN        required. Analysis token for the project.
+#   vars.SONAR_HOST_URL        SonarQube Server URL. Leave unset for SonarQube Cloud.
+#   vars.SONAR_PROJECT_KEY     defaults to <owner>_<repo>, the SonarQube Cloud convention.
+#   vars.SONAR_ORGANIZATION    defaults to <owner> on SonarQube Cloud; unused on Server.
+#   vars.SONAR_COVERAGE        "true" runs the unit test shard with coverage first.
+#                              The shard measures several hours of test time on
+#                              hosted runners, so it stays off by default.
+#
+# Pull requests from forks never receive secrets and are skipped. SonarQube
+# Community Build analyzes only the main branch; drop the pull_request trigger
+# when pointing at one. On SonarQube Cloud, turn off Automatic Analysis for the
+# project first: it refuses CI-based scans while both are active.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+  workflow_dispatch:
+    inputs:
+      coverage:
+        description: Run the unit test shard with coverage before the scan (several hours).
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sonarqube-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  NODE_VERSION: "24.21.0"
+
+jobs:
+  analyze:
+    name: Analyze
+    # Fork pull requests have no SONAR_TOKEN; drafts wait until they are ready.
+    if: ${{ github.event_name != 'pull_request' || (!github.event.pull_request.draft && github.event.pull_request.head.repo.full_name == github.repository) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ (inputs.coverage || vars.SONAR_COVERAGE == 'true') && 360 || 90 }}
+    env:
+      RUN_COVERAGE: ${{ (inputs.coverage || vars.SONAR_COVERAGE == 'true') && 'true' || 'false' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history lets SonarQube attribute blame and detect new code.
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Installed dependencies give the TypeScript analyzer real types for
+      # third-party imports; the scan runs without them, just less precisely.
+      - name: Setup Node environment
+        uses: ./.github/actions/setup-node-env
+        with:
+          cache-mode: "off"
+          install-bun: "false"
+
+      - name: Run unit tests with coverage
+        id: coverage
+        if: env.RUN_COVERAGE == 'true'
+        continue-on-error: true
+        env:
+          NODE_OPTIONS: --max-old-space-size=8192
+          OPENCLAW_VITEST_MAX_WORKERS: "2"
+        run: pnpm test:coverage
+
+      - name: Report missing coverage
+        if: env.RUN_COVERAGE == 'true' && steps.coverage.outcome != 'success'
+        run: echo "::warning::pnpm test:coverage failed; the scan continues without coverage data."
+
+      - name: Resolve SonarQube project settings
+        id: sonar
+        env:
+          HOST_URL: ${{ vars.SONAR_HOST_URL || 'https://sonarcloud.io' }}
+          ORGANIZATION: ${{ vars.SONAR_ORGANIZATION }}
+          PROJECT_KEY: ${{ vars.SONAR_PROJECT_KEY }}
+          REPOSITORY: ${{ github.repository }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          project_key="${PROJECT_KEY:-${REPOSITORY//\//_}}"
+          args="-Dsonar.projectKey=${project_key}"
+          # SonarQube Cloud requires an organization; SonarQube Server ignores it.
+          if [[ "$HOST_URL" == "https://sonarcloud.io" ]]; then
+            args+=" -Dsonar.organization=${ORGANIZATION:-$REPOSITORY_OWNER}"
+          elif [[ -n "$ORGANIZATION" ]]; then
+            args+=" -Dsonar.organization=${ORGANIZATION}"
+          fi
+          echo "Scanning as ${project_key} against ${HOST_URL}"
+          echo "args=${args}" >> "$GITHUB_OUTPUT"
+
+      - name: SonarQube scan
+        uses: SonarSource/sonarqube-scan-action@d209202bc7d53ff1cc128f7f907dac145c9d6ae9 # v8.3.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL || 'https://sonarcloud.io' }}
+          SONAR_SCANNER_JAVA_OPTS: -Xmx4g
+        with:
+          args: ${{ steps.sonar.outputs.args }}
